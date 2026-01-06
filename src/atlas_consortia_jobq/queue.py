@@ -8,7 +8,7 @@ from typing import Callable, Any, Optional, List, Dict
 from redis import Redis, ConnectionError, RedisError
 
 
-class SearchQueue:
+class JobQueue:
     """
     A Redis-based priority queue system for managing background jobs.
     
@@ -40,7 +40,7 @@ class SearchQueue:
     def __init__(self, redis_host: str = 'localhost', redis_port: int = 6379, 
                  redis_db: int = 0, redis_password: Optional[str] = None):
         """
-        Initialize SearchQueue with Redis connection details.
+        Initialize JobQueue with Redis connection details.
         
         Args:
             redis_host: Redis server hostname
@@ -371,8 +371,8 @@ class SearchQueue:
                 # Fork a new process that runs the worker loop
                 proc = subprocess.Popen(
                     [sys.executable, "-c", 
-                     f"from {self.__module__} import SearchQueue; "
-                     f"queue = SearchQueue('{self.redis_conn.connection_pool.connection_kwargs['host']}', "
+                     f"from {self.__module__} import JobQueue; "
+                     f"queue = JobQueue('{self.redis_conn.connection_pool.connection_kwargs['host']}', "
                      f"{self.redis_conn.connection_pool.connection_kwargs['port']}, "
                      f"{self.redis_conn.connection_pool.connection_kwargs['db']}); "
                      f"queue._worker_loop()"]
