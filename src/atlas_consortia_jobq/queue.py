@@ -10,7 +10,7 @@ from typing import Callable, Any, Optional, List, Dict
 from redis import Redis, ConnectionError, RedisError
 
 # For dynamic import inside docker container
-sys.path.append("/usr/src/app/src")
+sys.path.append(["/usr/src/app/src", "/usr/src/app/src/search-adaptor/src"])
 
 class JobQueue:
     """
