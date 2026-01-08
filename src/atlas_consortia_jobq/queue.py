@@ -2,6 +2,7 @@ import json
 import uuid
 import time
 import importlib
+import logging
 import subprocess
 from datetime import datetime, timezone
 from typing import Callable, Any, Optional, List, Dict
@@ -38,7 +39,7 @@ class JobQueue:
     """
     
     def __init__(self, redis_host: str = 'localhost', redis_port: int = 6379, 
-                 redis_db: int = 0, redis_password: Optional[str] = None):
+                 redis_db: int = 0, redis_password: Optional[str] = None, log_level: int = logging.INFO):
         """
         Initialize JobQueue with Redis connection details.
         
@@ -47,10 +48,14 @@ class JobQueue:
             redis_port: Redis server port
             redis_db: Redis database number
             redis_password: Redis password (optional)
+            log_level: Logging level (default: logging.INFO)
             
         Raises:
             ConnectionError: If unable to connect to Redis
         """
+        self.logger = logging.getLogger(f"{__name__}.JobQueue")
+        self.logger.setLevel(log_level)
+
         try:
             self.redis_conn = Redis(
                 host=redis_host, 
@@ -60,14 +65,17 @@ class JobQueue:
                 decode_responses=False  # Keep as bytes for consistency
             )
             self.redis_conn.ping()
-            print(f"Successfully connected to Redis at {redis_host}:{redis_port}, DB {redis_db}")
+            self.logger.info(f"Successfully connected to Redis at {redis_host}:{redis_port}, DB {redis_db}")
         except ConnectionError as e:
+            self.logger.error(f"Failed to connect to Redis at {redis_host}:{redis_port}: {e}")
             raise ConnectionError(f"Failed to connect to Redis at {redis_host}:{redis_port}: {e}")
         
         # Load Lua script
         try:
             self.pop_and_fetch_script = self.redis_conn.script_load(self.POP_AND_FETCH_JOB)
+            self.logger.debug("Lua script loaded successfully")
         except RedisError as e:
+            self.logger.error(f"Failed to load Lua script: {e}")
             raise RedisError(f"Failed to load Lua script: {e}")
     
     @staticmethod
@@ -119,6 +127,7 @@ class JobQueue:
                     
                     # If new priority is higher (lower number), update it
                     if current_priority is not None and priority < current_priority:
+                        self.logger.info(f"Updating priority for entity {entity_id} from {current_priority} to {priority}")
                         return self._apply_priority_update(existing_job_id, priority)
                 
                 # Otherwise return existing job_id
@@ -145,9 +154,11 @@ class JobQueue:
             self.redis_conn.zadd(self.JOB_QUEUE_KEY, {job_id: priority})
             self.redis_conn.hset(self.ENTITY_INDEX_KEY, entity_id, job_id)
             
+            self.logger.info(f"Enqueued job {job_id} for entity {entity_id} with priority {priority}")
             return job_id
             
         except RedisError as e:
+            self.logger.error(f"Failed to enqueue job: {e}")
             raise RedisError(f"Failed to enqueue job: {e}")
     
     def update_priority(self, identifier: str, new_priority: int) -> str:
@@ -177,12 +188,14 @@ class JobQueue:
                 # Try as entity_id
                 job_id_lookup = self.redis_conn.hget(self.ENTITY_INDEX_KEY, identifier)
                 if not job_id_lookup:
+                    self.logger.warning(f"Job not found for identifier: {identifier}")
                     raise ValueError(f"Job not found for identifier: {identifier}")
                 job_id = job_id_lookup
             
             return self._apply_priority_update(job_id, new_priority)
             
         except RedisError as e:
+            self.logger.error(f"Failed to update priority: {e}")
             raise RedisError(f"Failed to update priority: {e}")
     
     def _apply_priority_update(self, job_id: str, new_priority: int) -> str:
@@ -191,6 +204,7 @@ class JobQueue:
         
         job_json = self.redis_conn.hget(self.JOB_HASH_KEY, job_id_bytes)
         if not job_json:
+            self.logger.error(f"Job data not found for job_id: {job_id}")
             raise ValueError(f"Job data not found for job_id: {job_id}")
         
         job_data = json.loads(job_json)
@@ -224,12 +238,14 @@ class JobQueue:
                 # Try as entity_id
                 job_id_lookup = self.redis_conn.hget(self.ENTITY_INDEX_KEY, identifier)
                 if not job_id_lookup:
+                    self.logger.warning(f"Job not found for identifier: {identifier}")
                     raise ValueError(f"Job not found for identifier: {identifier}")
                 job_id_bytes = job_id_lookup
             
             # Get position in queue
             position = self.redis_conn.zrank(self.JOB_QUEUE_KEY, job_id_bytes)
             if position is None:
+                self.logger.warning(f"Job not in queue (may have been processed): {identifier}")
                 raise ValueError(f"Job not in queue (may have been processed): {identifier}")
             
             priority = self.redis_conn.zscore(self.JOB_QUEUE_KEY, job_id_bytes)
@@ -241,6 +257,7 @@ class JobQueue:
             }
             
         except RedisError as e:
+            self.logger.error(f"Failed to get job status: {e}")
             raise RedisError(f"Failed to get job status: {e}")
     
     def get_queue_status(self) -> Dict[str, Any]:
@@ -261,12 +278,14 @@ class JobQueue:
                 "3": self.redis_conn.zcount(self.JOB_QUEUE_KEY, 3, 3)
             }
             
+            self.logger.debug(f"Queue status: {total_jobs} total jobs")
             return {
                 "total_jobs": total_jobs,
                 "count_by_priority": priority_counts
             }
             
         except RedisError as e:
+            self.logger.error(f"Failed to get queue status: {e}")
             raise RedisError(f"Failed to get queue status: {e}")
     
     def _execute_job(self, job_data: Dict[str, Any]) -> bool:
@@ -286,12 +305,14 @@ class JobQueue:
         job_id = job_data.get('job_id', 'unknown')
         
         try:
+            self.logger.debug(f"Executing job {job_id}: {module_name}.{func_name}")
             module = importlib.import_module(module_name)
             func = getattr(module, func_name)
             func(*args, **kwargs)
+            self.logger.info(f"Job {job_id} executed successfully")
             return True
         except Exception as e:
-            print(f"Error executing job {job_id}: {e}")
+            self.logger.error(f"Error executing job {job_id}: {e}", exc_info=True)
             return False
     
     def _worker_loop(self):
@@ -299,7 +320,7 @@ class JobQueue:
         Main worker loop. Continuously polls Redis for jobs and executes them.
         This runs in a subprocess spawned by start_workers().
         """
-        print(f"Worker (PID {subprocess.os.getpid()}) starting up.")
+        self.logger.info(f"Worker (PID {subprocess.os.getpid()}) starting up")
         
         while True:
             try:
@@ -311,7 +332,7 @@ class JobQueue:
                     self.JOB_HASH_KEY
                 )
             except RedisError as e:
-                print(f"FATAL: Error during job pop: {e}. Worker exiting.")
+                self.logger.critical(f"FATAL: Error during job pop: {e}. Worker exiting.")
                 break
             
             if not result:
@@ -325,7 +346,7 @@ class JobQueue:
             job_json = result[1]
             job_data = json.loads(job_json)
             
-            print(f"Worker (PID {subprocess.os.getpid()}) starting job: {job_id_str} (Priority {job_data.get('priority', '?')})")
+            self.logger.info(f"Worker (PID {subprocess.os.getpid()}) starting job: {job_id_str} (Priority {job_data.get('priority', '?')})")
             
             try:
                 job_successful = self._execute_job(job_data)
@@ -336,15 +357,15 @@ class JobQueue:
                     self.redis_conn.hdel(self.ENTITY_INDEX_KEY, job_data['entity_id'])
                     
                     if job_successful:
-                        print(f"Worker (PID {subprocess.os.getpid()}) completed job {job_id_str} successfully. Metadata cleaned.")
+                        self.logger.info(f"Worker (PID {subprocess.os.getpid()}) completed job {job_id_str} successfully. Metadata cleaned.")
                     else:
-                        print(f"Worker (PID {subprocess.os.getpid()}) job {job_id_str} failed. Metadata cleaned.")
+                        self.logger.warning(f"Worker (PID {subprocess.os.getpid()}) job {job_id_str} failed. Metadata cleaned.")
                         
                 except RedisError as e:
-                    print(f"FATAL Cleanup Error for job {job_id_str}: {e}. Worker forced to exit.")
+                    self.logger.warning(f"FATAL Cleanup Error for job {job_id_str}: {e}. Worker forced to exit.")
                     break
         
-        print(f"Worker (PID {subprocess.os.getpid()}) shut down.")
+        self.logger.info(f"Worker (PID {subprocess.os.getpid()}) shut down")
     
     def start_workers(self, num_workers: int = 4):
         """
@@ -365,7 +386,7 @@ class JobQueue:
         processes = []
         
         try:
-            print(f"Starting {num_workers} worker processes...")
+            self.logger.info(f"Starting {num_workers} worker processes...")
             
             for i in range(num_workers):
                 # Fork a new process that runs the worker loop
@@ -378,24 +399,24 @@ class JobQueue:
                      f"queue._worker_loop()"]
                 )
                 processes.append(proc)
-                print(f"Started worker {i+1}/{num_workers} (PID {proc.pid})")
+                self.logger.info(f"Started worker {i+1}/{num_workers} (PID {proc.pid})")
                 time.sleep(0.05)  # Small delay to avoid flooding
             
-            print(f"All {num_workers} workers started. Press Ctrl+C to terminate.")
-            
+            self.logger.info(f"All {num_workers} workers started. Press Ctrl+C to terminate.")
+
             # Wait for all workers
             for proc in processes:
                 proc.wait()
                 
         except KeyboardInterrupt:
-            print("\nTerminating all workers...")
+            self.logger.info("\nTerminating all workers...")
             for proc in processes:
                 proc.terminate()
             for proc in processes:
                 proc.wait()
-            print("All workers terminated.")
+            self.logger.info("All workers terminated.")
         except Exception as e:
-            print(f"Error managing workers: {e}")
+            self.logger.info(f"Error managing workers: {e}")
             for proc in processes:
                 if proc.poll() is None:
                     proc.terminate()
