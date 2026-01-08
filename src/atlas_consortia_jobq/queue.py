@@ -1,3 +1,4 @@
+import sys
 import json
 import uuid
 import time
@@ -8,6 +9,8 @@ from datetime import datetime, timezone
 from typing import Callable, Any, Optional, List, Dict
 from redis import Redis, ConnectionError, RedisError
 
+# For dynamic import inside docker container
+sys.path.append("/usr/src/app/src")
 
 class JobQueue:
     """
