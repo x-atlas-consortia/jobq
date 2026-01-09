@@ -390,14 +390,17 @@ class JobQueue:
             
             for i in range(num_workers):
                 # Fork a new process that runs the worker loop
-                proc = subprocess.Popen(
-                    [sys.executable, "-c", 
-                     f"from {self.__module__} import JobQueue; "
-                     f"queue = JobQueue('{self.redis_conn.connection_pool.connection_kwargs['host']}', "
-                     f"{self.redis_conn.connection_pool.connection_kwargs['port']}, "
-                     f"{self.redis_conn.connection_pool.connection_kwargs['db']}); "
-                     f"queue._worker_loop()"]
-                )
+                proc = subprocess.Popen([
+                    sys.executable, "-c",
+                    "import sys; "
+                    "sys.path.insert(0, '/usr/src/app/src'); "
+                    "sys.path.insert(0, '/usr/src/app/src/search-adaptor/src'); "
+                    f"from {self.__module__} import JobQueue; "
+                    f"queue = JobQueue('{self.redis_conn.connection_pool.connection_kwargs['host']}', "
+                    f"{self.redis_conn.connection_pool.connection_kwargs['port']}, "
+                    f"{self.redis_conn.connection_pool.connection_kwargs['db']}); "
+                    "queue._worker_loop()"
+                ])
                 processes.append(proc)
                 self.logger.info(f"Started worker {i+1}/{num_workers} (PID {proc.pid})")
                 time.sleep(0.05)  # Small delay to avoid flooding
