@@ -21,6 +21,8 @@ class JobQueue:
     JOB_QUEUE_KEY = 'job_queue_zset'
     JOB_HASH_KEY = 'jobs_data'
     ENTITY_INDEX_KEY = 'entity_uuid'
+    PROCESSING_ENTITIES_KEY = 'processing_entities'
+
     
     # Lua script for atomic pop and fetch
     POP_AND_FETCH_JOB = """
@@ -133,6 +135,11 @@ class JobQueue:
                 # Otherwise return existing job_id
                 return existing_job_id.decode() if isinstance(existing_job_id, bytes) else existing_job_id
             
+            processing_job_id = self.redis_conn.hget(self.PROCESSING_ENTITIES_KEY, entity_id)
+            if processing_job_id:
+                self.logger.info(f"Entity {entity_id} is currently being processed by job {processing_job_id.decode() if isinstance(processing_job_id, bytes) else processing_job_id}")
+                return processing_job_id.decode() if isinstance(processing_job_id, bytes) else processing_job_id
+
             # Create new job
             job_id = self._generate_job_id()
             now = datetime.now(timezone.utc).isoformat()
@@ -259,6 +266,12 @@ class JobQueue:
         except RedisError as e:
             self.logger.error(f"Failed to get job status: {e}")
             raise RedisError(f"Failed to get job status: {e}")
+        except ValueError as e:
+            self.logger.error(f"Failed to get job status: {e}")
+            raise ValueError(f"Failed to get job status: {e}")
+        except Exception as e:
+            self.logger.error(f"Failed to get job status: {e}")
+            raise Exception(f"Failed to get job status: {e}")
     
     def get_queue_status(self) -> Dict[str, Any]:
         """
@@ -345,16 +358,24 @@ class JobQueue:
             job_id_str = job_id.decode() if isinstance(job_id, bytes) else job_id
             job_json = result[1]
             job_data = json.loads(job_json)
+        
+            entity_id = job_data['entity_id']
+            try:
+                self.redis_conn.hset(self.PROCESSING_ENTITIES_KEY, entity_id, job_id)
+                self.logger.debug(f"Marked entity {entity_id} as processing")
+            except RedisError as e:
+                self.logger.warning(f"Failed to mark entity {entity_id} as processing: {e}")
             
             self.logger.info(f"Worker (PID {subprocess.os.getpid()}) starting job: {job_id_str} (Priority {job_data.get('priority', '?')})")
-            
+
             try:
                 job_successful = self._execute_job(job_data)
             finally:
                 # Clean up job metadata
                 try:
                     self.redis_conn.hdel(self.JOB_HASH_KEY, job_id)
-                    self.redis_conn.hdel(self.ENTITY_INDEX_KEY, job_data['entity_id'])
+                    self.redis_conn.hdel(self.ENTITY_INDEX_KEY, entity_id)
+                    self.redis_conn.hdel(self.PROCESSING_ENTITIES_KEY, entity_id)
                     
                     if job_successful:
                         self.logger.info(f"Worker (PID {subprocess.os.getpid()}) completed job {job_id_str} successfully. Metadata cleaned.")
@@ -393,6 +414,7 @@ class JobQueue:
                 proc = subprocess.Popen([
                     sys.executable, "-c",
                     "import sys; "
+                    # 
                     "sys.path.insert(0, '/usr/src/app/src'); "
                     "sys.path.insert(0, '/usr/src/app/src/search-adaptor/src'); "
                     f"from {self.__module__} import JobQueue; "
