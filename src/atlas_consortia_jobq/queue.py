@@ -28,6 +28,7 @@ class JobQueue:
     POP_AND_FETCH_JOB = """
     -- KEYS[1]: JOB_QUEUE_KEY (zset)
     -- KEYS[2]: JOB_HASH_KEY (hash)
+    -- KEYS[3]: PROCESSING_ENTITIES_KEY (hash)
     local pop_result = redis.call('ZPOPMIN', KEYS[1], 1)
     if #pop_result == 0 then
         return nil
@@ -37,7 +38,44 @@ class JobQueue:
     if not job_json then
         return nil
     end
+    local job_data = cjson.decode(job_json)
+    local entity_id = job_data['entity_id']
+    if entity_id then
+        redis.call('HSET', KEYS[3], entity_id, job_id)
+    end
     return {job_id, job_json}
+    """
+    # Lua script for atomic check-and-enqueue
+    ENQUEUE_JOB_ATOMIC = """
+    -- KEYS[1]: JOB_QUEUE_KEY, KEYS[2]: JOB_HASH_KEY, KEYS[3]: ENTITY_INDEX_KEY, KEYS[4]: PROCESSING_ENTITIES_KEY
+    -- ARGV[1]: entity_id, ARGV[2]: job_id, ARGV[3]: job_json, ARGV[4]: priority, ARGV[5]: now
+    
+    local existing_job_id = redis.call('HGET', KEYS[3], ARGV[1])
+    if existing_job_id then
+        local job_json = redis.call('HGET', KEYS[2], existing_job_id)
+        if job_json then
+            local job_data = cjson.decode(job_json)
+            if tonumber(ARGV[4]) < tonumber(job_data['priority']) then
+                job_data['priority'] = tonumber(ARGV[4])
+                job_data['priority_updated_timestamp'] = ARGV[5]
+                local updated_json = cjson.encode(job_data)
+                redis.call('HSET', KEYS[2], existing_job_id, updated_json)
+                redis.call('ZADD', KEYS[1], tonumber(ARGV[4]), existing_job_id)
+                return "UPDATED:" .. existing_job_id
+            end
+        end
+        return "EXISTS:" .. existing_job_id
+    end
+    
+    local processing_id = redis.call('HGET', KEYS[4], ARGV[1])
+    if processing_id then
+        return "PROCESSING:" .. processing_id
+    end
+    
+    redis.call('HSET', KEYS[2], ARGV[2], ARGV[3])
+    redis.call('ZADD', KEYS[1], tonumber(ARGV[4]), ARGV[2])
+    redis.call('HSET', KEYS[3], ARGV[1], ARGV[2])
+    return "CREATED:" .. ARGV[2]
     """
     
     def __init__(self, redis_host: str = 'localhost', redis_port: int = 6379, 
@@ -75,7 +113,8 @@ class JobQueue:
         # Load Lua script
         try:
             self.pop_and_fetch_script = self.redis_conn.script_load(self.POP_AND_FETCH_JOB)
-            self.logger.debug("Lua script loaded successfully")
+            self.enqueue_atomic_script = self.redis_conn.script_load(self.ENQUEUE_JOB_ATOMIC)
+            self.logger.debug("Lua scripts loaded successfully")
         except RedisError as e:
             self.logger.error(f"Failed to load Lua script: {e}")
             raise RedisError(f"Failed to load Lua script: {e}")
@@ -118,27 +157,6 @@ class JobQueue:
             kwargs = {}
         
         try:
-            # Check if job already exists for this entity
-            existing_job_id = self.redis_conn.hget(self.ENTITY_INDEX_KEY, entity_id)
-            
-            if existing_job_id:
-                existing_job_json = self.redis_conn.hget(self.JOB_HASH_KEY, existing_job_id)
-                if existing_job_json:
-                    existing_data = json.loads(existing_job_json)
-                    current_priority = existing_data.get("priority")
-                    
-                    # If new priority is higher (lower number), update it
-                    if current_priority is not None and priority < current_priority:
-                        self.logger.info(f"Updating priority for entity {entity_id} from {current_priority} to {priority}")
-                        return self._apply_priority_update(existing_job_id, priority)
-                
-                # Otherwise return existing job_id
-                return existing_job_id.decode() if isinstance(existing_job_id, bytes) else existing_job_id
-            
-            processing_job_id = self.redis_conn.hget(self.PROCESSING_ENTITIES_KEY, entity_id)
-            if processing_job_id:
-                self.logger.info(f"Entity {entity_id} is currently being processed by job {processing_job_id.decode() if isinstance(processing_job_id, bytes) else processing_job_id}")
-                return processing_job_id.decode() if isinstance(processing_job_id, bytes) else processing_job_id
 
             # Create new job
             job_id = self._generate_job_id()
@@ -155,14 +173,34 @@ class JobQueue:
                 "queued_timestamp": now,
                 "priority_updated_timestamp": None
             }
+
+            result = self.redis_conn.evalsha(
+                self.enqueue_atomic_script,
+                4,
+                self.JOB_QUEUE_KEY,
+                self.JOB_HASH_KEY,
+                self.ENTITY_INDEX_KEY,
+                self.PROCESSING_ENTITIES_KEY,
+                entity_id,
+                job_id,
+                json.dumps(job_data),
+                priority,
+                now
+            )
             
-            # Store job data and add to queue
-            self.redis_conn.hset(self.JOB_HASH_KEY, job_id, json.dumps(job_data))
-            self.redis_conn.zadd(self.JOB_QUEUE_KEY, {job_id: priority})
-            self.redis_conn.hset(self.ENTITY_INDEX_KEY, entity_id, job_id)
-            
-            self.logger.info(f"Enqueued job {job_id} for entity {entity_id} with priority {priority}")
-            return job_id
+            result_str = result.decode() if isinstance(result, bytes) else result
+            status, returned_id = result_str.split(':', 1)
+
+            if status == "UPDATED":
+                self.logger.info(f"Updating priority for entity {entity_id} to {priority}")
+            elif status == "EXISTS":
+                pass
+            elif status == "PROCESSING":
+                self.logger.info(f"Entity {entity_id} is currently being processed by job {returned_id}")
+            elif status == "CREATED":
+                self.logger.info(f"Enqueued job {returned_id} for entity {entity_id} with priority {priority}")
+                
+            return returned_id
             
         except RedisError as e:
             self.logger.error(f"Failed to enqueue job: {e}")
@@ -340,9 +378,10 @@ class JobQueue:
                 # Pop job from queue atomically
                 result = self.redis_conn.evalsha(
                     self.pop_and_fetch_script, 
-                    2, 
+                    3, 
                     self.JOB_QUEUE_KEY, 
-                    self.JOB_HASH_KEY
+                    self.JOB_HASH_KEY,
+                    self.PROCESSING_ENTITIES_KEY
                 )
             except RedisError as e:
                 self.logger.critical(f"FATAL: Error during job pop: {e}. Worker exiting.")
@@ -360,12 +399,6 @@ class JobQueue:
             job_data = json.loads(job_json)
         
             entity_id = job_data['entity_id']
-            try:
-                self.redis_conn.hset(self.PROCESSING_ENTITIES_KEY, entity_id, job_id)
-                self.logger.debug(f"Marked entity {entity_id} as processing")
-            except RedisError as e:
-                self.logger.warning(f"Failed to mark entity {entity_id} as processing: {e}")
-            
             self.logger.info(f"Worker (PID {subprocess.os.getpid()}) starting job: {job_id_str} (Priority {job_data.get('priority', '?')})")
 
             try:
