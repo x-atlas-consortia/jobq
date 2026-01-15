@@ -414,7 +414,12 @@ class JobQueue:
                 proc = subprocess.Popen([
                     sys.executable, "-c",
                     "import sys; "
-                    # 
+                    #Explicitly add the application source roots to sys.path for worker processes.
+                    #These subprocesses are launched outside the normal entrypoint and do not
+                    #inherit the same working directory or import context as the main service.
+                    #Adding these paths ensures imports resolve against the project source tree
+                    #rather than relying on implicit CWD behavior, which may change if the
+                    #repository layout is modified in the future.
                     "sys.path.insert(0, '/usr/src/app/src'); "
                     "sys.path.insert(0, '/usr/src/app/src/search-adaptor/src'); "
                     f"from {self.__module__} import JobQueue; "
