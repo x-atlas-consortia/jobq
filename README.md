@@ -1,4 +1,6 @@
 # Atlas Consortia JobQ
+[![PyPI version](https://badge.fury.io/py/atlas-consortia-jobq.svg)](https://badge.fury.io/py/atlas-consortia-jobq)
+
 **Atlas Consortia JobQ** is a high-performance, Redis-backed priority queue system designed for background task management. 
 
 ## Table of Contents
