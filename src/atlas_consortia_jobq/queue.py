@@ -277,6 +277,8 @@ class JobQueue:
         """
         try:
             job_id_bytes = identifier.encode() if isinstance(identifier, str) else identifier
+
+            entity_id = identifier
             
             # Check if it's a job_id
             if not self.redis_conn.hexists(self.JOB_HASH_KEY, job_id_bytes):
@@ -286,17 +288,28 @@ class JobQueue:
                     self.logger.warning(f"Job not found for identifier: {identifier}")
                     raise ValueError(f"Job not found for identifier: {identifier}")
                 job_id_bytes = job_id_lookup
+            else:
+                # If identifier was a job_id, we need to fetch the entity_id from the metadata
+                job_json = self.redis_conn.hget(self.JOB_HASH_KEY, job_id_bytes)
+                job_data = json.loads(job_json)
+                entity_id = job_data.get('entity_id')
             
             # Get position in queue
             position = self.redis_conn.zrank(self.JOB_QUEUE_KEY, job_id_bytes)
+            status = "queued"
             if position is None:
-                self.logger.warning(f"Job not in queue (may have been processed): {identifier}")
-                raise ValueError(f"Job not in queue (may have been processed): {identifier}")
+                # If not in ZSET, check if it's currently being processed
+                if self.redis_conn.hexists(self.PROCESSING_ENTITIES_KEY, entity_id):
+                    status = "processing"
+                else:
+                    self.logger.warning(f"Job not found in queue or processing: {identifier}")
+                    raise ValueError(f"Job not found in queue or processing: {identifier}")
             
             priority = self.redis_conn.zscore(self.JOB_QUEUE_KEY, job_id_bytes)
             
             return {
                 "job_id": job_id_bytes.decode() if isinstance(job_id_bytes, bytes) else job_id_bytes,
+                "status": status,
                 "position_in_queue": position,
                 "priority": int(priority) if priority is not None else None
             }
