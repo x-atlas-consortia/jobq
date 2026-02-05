@@ -357,8 +357,8 @@ class JobQueue:
                 queued_ids = self.redis_conn.zrange(self.JOB_QUEUE_KEY, 0, -1)
                 status["queued_entities"] = self._get_detailed_info(queued_ids, mode='all_queued')
             if all_processing:
-                processing_ids = self.redis_conn.hkeys(self.PROCESSING_ENTITIES_KEY)
-                status["processing_entities"] = self._get_detailed_info(processing_ids, mode='all_processing')
+                processing_job_ids = self.redis_conn.hvals(self.PROCESSING_ENTITIES_KEY) 
+                status["processing_entities"] = self._get_detailed_info(processing_job_ids, mode='all_processing')
             
             return status
             
