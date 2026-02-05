@@ -283,42 +283,43 @@ class JobQueue:
         """
         try:
             job_id_bytes = identifier.encode() if isinstance(identifier, str) else identifier
-
-            entity_id = identifier
-            
-            # Check if it's a job_id
-            if not self.redis_conn.hexists(self.JOB_HASH_KEY, job_id_bytes):
-                # Try as entity_id
+            job_json = self.redis_conn.hget(self.JOB_HASH_KEY, job_id_bytes)
+            if not job_json:
                 job_id_lookup = self.redis_conn.hget(self.ENTITY_INDEX_KEY, identifier)
                 if not job_id_lookup:
-                    self.logger.warning(f"Job not found for identifier: {identifier}")
                     raise ValueError(f"Job not found for identifier: {identifier}")
                 job_id_bytes = job_id_lookup
-            else:
-                # If identifier was a job_id, we need to fetch the entity_id from the metadata
                 job_json = self.redis_conn.hget(self.JOB_HASH_KEY, job_id_bytes)
-                job_data = json.loads(job_json)
-                entity_id = job_data.get('entity_id')
             
-            # Get position in queue
-            position = self.redis_conn.zrank(self.JOB_QUEUE_KEY, job_id_bytes)
-            status = "queued"
-            if position is None:
-                # If not in ZSET, check if it's currently being processed
-                if self.redis_conn.hexists(self.PROCESSING_ENTITIES_KEY, entity_id):
-                    status = "processing"
-                else:
-                    self.logger.warning(f"Job not found in queue or processing: {identifier}")
-                    raise ValueError(f"Job not found in queue or processing: {identifier}")
-            
-            priority = self.redis_conn.zscore(self.JOB_QUEUE_KEY, job_id_bytes)
-            
-            return {
-                "job_id": job_id_bytes.decode() if isinstance(job_id_bytes, bytes) else job_id_bytes,
-                "status": status,
-                "position_in_queue": position,
-                "priority": int(priority) if priority is not None else None
+            job_data = json.loads(job_json)
+            entity_id = job_data.get('entity_id')
+            job_id_str = job_id_bytes.decode() if isinstance(job_id_bytes, bytes) else job_id_bytes
+            overall_position = self.redis_conn.zrank(self.JOB_QUEUE_KEY, job_id_bytes)
+
+            response = {
+                "uuid": job_data.get('metadata', {}).get('uuid'),
+                "hubmap_id": job_data.get('metadata', {}).get('hubmap_id'),
+                "priority": job_data.get('priority'),
+                "queued_timestamp": job_data.get('queued_timestamp'),
+                "priority_updated_timestamp": job_data.get('priority_updated_timestamp'),
+                "status": "queued"
             }
+
+            if overall_position is not None:
+                priority_score = job_data.get('priority')
+                items_ahead = self.redis_conn.zrange(self.JOB_QUEUE_KEY, 0, overall_position - 1, withscores=True)
+                count_same_priority = sum(1 for _, score in items_ahead if int(score) == priority_score)
+
+                response["status"] = "queued"
+                response["execution_number_in_priority"] = count_same_priority + 1
+            
+            elif self.redis_conn.hexists(self.PROCESSING_ENTITIES_KEY, entity_id):
+                response["status"] = "processing"
+                response["process_start_timestamp"] = job_data.get('process_start_timestamp')
+            else:
+                raise ValueError(f"Job {job_id_str} is no longer in the active system.")
+
+            return response
             
         except RedisError as e:
             self.logger.error(f"Failed to get job status: {e}")
