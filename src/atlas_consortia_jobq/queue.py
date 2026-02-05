@@ -29,6 +29,7 @@ class JobQueue:
     -- KEYS[1]: JOB_QUEUE_KEY (zset)
     -- KEYS[2]: JOB_HASH_KEY (hash)
     -- KEYS[3]: PROCESSING_ENTITIES_KEY (hash)
+    -- ARGV[1]: current_timestamp
     local pop_result = redis.call('ZPOPMIN', KEYS[1], 1)
     if #pop_result == 0 then
         return nil
@@ -40,10 +41,13 @@ class JobQueue:
     end
     local job_data = cjson.decode(job_json)
     local entity_id = job_data['entity_id']
+    job_data['process_start_timestamp'] = ARGV[1]
+    local updated_json = cjson.encode(job_data)
+    redis.call('HSET', KEYS[2], job_id, updated_json)
     if entity_id then
         redis.call('HSET', KEYS[3], entity_id, job_id)
     end
-    return {job_id, job_json}
+    return {job_id, updated_json}
     """
     # Lua script for atomic check-and-enqueue
     ENQUEUE_JOB_ATOMIC = """
@@ -126,7 +130,7 @@ class JobQueue:
     
     def enqueue(self, task_func: Callable, entity_id: str, 
                 args: Optional[List] = None, kwargs: Optional[Dict] = None, 
-                priority: int = 1) -> str:
+                priority: int = 1, job_metadata: Optional[Dict] = None) -> str:
         """
         Enqueue a job for processing.
         
@@ -171,9 +175,11 @@ class JobQueue:
                 "entity_id": entity_id,
                 "priority": priority,
                 "queued_timestamp": now,
-                "priority_updated_timestamp": None
+                "priority_updated_timestamp": None,
+                "metadata": {}
             }
-
+            if job_metadata:
+                job_data['metadata'] = job_metadata
             result = self.redis_conn.evalsha(
                 self.enqueue_atomic_script,
                 4,
@@ -324,7 +330,7 @@ class JobQueue:
             self.logger.error(f"Failed to get job status: {e}")
             raise Exception(f"Failed to get job status: {e}")
     
-    def get_queue_status(self) -> Dict[str, Any]:
+    def get_queue_status(self, all_queued: bool = False, all_processing: bool = False) -> Dict[str, Any]:
         """
         Get overall queue status.
         
@@ -335,22 +341,53 @@ class JobQueue:
             RedisError: If Redis operations fail
         """
         try:
-            total_jobs = self.redis_conn.hlen(self.JOB_HASH_KEY)
-            priority_counts = {
-                "1": self.redis_conn.zcount(self.JOB_QUEUE_KEY, 1, 1),
-                "2": self.redis_conn.zcount(self.JOB_QUEUE_KEY, 2, 2),
-                "3": self.redis_conn.zcount(self.JOB_QUEUE_KEY, 3, 3)
-            }
+            active_jobs_count = self.redis_conn.hlen(self.PROCESSING_ENTITIES_KEY)
+            p1 = self.redis_conn.zcount(self.JOB_QUEUE_KEY, 1, 1)
+            p2 = self.redis_conn.zcount(self.JOB_QUEUE_KEY, 2, 2)
+            p3 = self.redis_conn.zcount(self.JOB_QUEUE_KEY, 3, 3)
             
-            self.logger.debug(f"Queue status: {total_jobs} total jobs")
-            return {
-                "total_jobs": total_jobs,
-                "count_by_priority": priority_counts
+            self.logger.debug(f"Queue status: {active_jobs_count} processing, {p1 + p2 + p3} queued")
+            status = {
+                "jobs_processing": active_jobs_count,
+                "priority_1_queued": p1,
+                "priority_2_queued": p2,
+                "priority_3_queued": p3
             }
+            if all_queued:
+                queued_ids = self.redis_conn.zrange(self.JOB_QUEUE_KEY, 0, -1)
+                status["queued_entities"] = self._get_detailed_info(queued_ids, mode='all_queued')
+            if all_processing:
+                processing_ids = self.redis_conn.hkeys(self.PROCESSING_ENTITIES_KEY)
+                status["processing_entities"] = self._get_detailed_info(processing_ids, mode='all_processing')
+            
+            return status
             
         except RedisError as e:
             self.logger.error(f"Failed to get queue status: {e}")
             raise RedisError(f"Failed to get queue status: {e}")
+    
+    def _get_detailed_info(self, job_ids: list, mode: str) -> list:
+        """Helper to fetch and format metadata for a list of job IDs."""
+        if not job_ids:
+            return []
+        
+        details = []
+        job_metadatas = self.redis_conn.hmget(self.JOB_HASH_KEY, job_ids)
+
+        for job_json in job_metadatas:
+            if job_json:
+                data = json.loads(job_json)
+                metadata = data.get("metadata", {})
+                details_dict = {
+                    "metadata": metadata,
+                    "priority": data.get("priority"),
+                    "queued_timestamp": data.get("queued_timestamp"),
+                    "priority_updated_timestamp": data.get("priority_updated_timestamp")
+                }
+                if mode == 'all_processing':
+                    details_dict["process_start_timestamp"] = data.get("process_start_timestamp")
+                details.append(details_dict)
+        return details
     
     def _execute_job(self, job_data: Dict[str, Any]) -> bool:
         """
@@ -389,12 +426,14 @@ class JobQueue:
         while True:
             try:
                 # Pop job from queue atomically
+                now = datetime.now(timezone.utc).isoformat()
                 result = self.redis_conn.evalsha(
                     self.pop_and_fetch_script, 
                     3, 
                     self.JOB_QUEUE_KEY, 
                     self.JOB_HASH_KEY,
-                    self.PROCESSING_ENTITIES_KEY
+                    self.PROCESSING_ENTITIES_KEY,
+                    now
                 )
             except RedisError as e:
                 self.logger.critical(f"FATAL: Error during job pop: {e}. Worker exiting.")
