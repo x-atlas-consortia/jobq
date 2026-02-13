@@ -112,6 +112,7 @@ class JobQueue:
             )
             self.redis_conn.ping()
             self.logger.info(f"Successfully connected to Redis at {redis_host}:{redis_port}, DB {redis_db}")
+            self.redis_conn.delete(self.TOTAL_PROCESSED_KEY, 'job_durations')
         except ConnectionError as e:
             msg = f"Failed to connect to Redis at {redis_host}:{redis_port}: {e}"
             self.logger.error(msg)
@@ -362,10 +363,10 @@ class JobQueue:
                 "priority_3_queued": p3
             }
 
-            total_processed = self.redis_conn.get(self.TOTAL_PROCESSED_KEY)
-            uptime_seconds = time.perf_counter - self.service_start_time
+            total_processed_raw = self.redis_conn.get(self.TOTAL_PROCESSED_KEY)
+            uptime_seconds = time.perf_counter() - self.service_start_time
             durations = self.redis_conn.lrange('job_durations', 0, -1)
-            status["total_jobs_processed"] = total_processed
+            status["total_jobs_processed"] = int(total_processed_raw) if total_processed_raw else 0
             status["uptime"] = uptime_seconds
             if durations:
                 floats = [float(d) for d in durations]
