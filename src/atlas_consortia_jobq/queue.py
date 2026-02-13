@@ -22,6 +22,7 @@ class JobQueue:
     JOB_HASH_KEY = 'jobs_data'
     ENTITY_INDEX_KEY = 'entity_uuid'
     PROCESSING_ENTITIES_KEY = 'processing_entities'
+    TOTAL_PROCESSED_KEY = 'total_processed_count'
 
     
     # Lua script for atomic pop and fetch
@@ -99,6 +100,7 @@ class JobQueue:
         """
         self.logger = logging.getLogger(f"{__name__}.JobQueue")
         self.logger.setLevel(log_level)
+        self.service_start_time = time.perf_counter()
 
         try:
             self.redis_conn = Redis(
@@ -360,19 +362,32 @@ class JobQueue:
                 "priority_3_queued": p3
             }
 
+            total_processed = self.redis_conn.get(self.TOTAL_PROCESSED_KEY)
+            uptime_seconds = time.perf_counter - self.service_start_time
             durations = self.redis_conn.lrange('job_durations', 0, -1)
+            status["total_jobs_processed"] = total_processed
+            status["uptime"] = uptime_seconds
             if durations:
-                avg_ms = sum(float(d) for d in durations) / len(durations)
-                status["avg_runtime_ms"] = round(avg_ms, 2)
+                floats = [float(d) for d in durations]
+                avg_ms = sum(d for d in floats) / len(durations)
+                min_secs = round(min(floats)/1000, 2)
+                max_secs = round(max(floats)/1000, 2)
+                avg_seconds = (avg_ms/1000)
+                rounded_avg_seconds = round(avg_seconds, 2)
+                status["avg_job_runtime"] = rounded_avg_seconds
+                status["min_job_runtime"] = min_secs
+                status["max_job_runtime"] = max_secs
             else:
-                status["avg_runtime_ms"] = 0
+                status["avg_job_runtime"] = 0
+                status["min_job_runtime"] = 0
+                status["max_job_runtime"] = 0
             if all_queued:
                 queued_ids = self.redis_conn.zrange(self.JOB_QUEUE_KEY, 0, -1)
                 status["queued_entities"] = self._get_detailed_info(queued_ids, mode='all_queued')
             if all_processing:
                 processing_job_ids = self.redis_conn.hvals(self.PROCESSING_ENTITIES_KEY) 
                 status["processing_entities"] = self._get_detailed_info(processing_job_ids, mode='all_processing')
-            
+
             return status
             
         except RedisError as e:
@@ -475,6 +490,7 @@ class JobQueue:
                     duration_ms = (time.perf_counter() - start_time) * 1000
                     self.redis_conn.lpush('job_durations', duration_ms)
                     self.redis_conn.ltrim('job_durations', 0, 49)
+                    self.redis_conn.incr(self.TOTAL_PROCESSED_KEY)
                     self.redis_conn.hdel(self.JOB_HASH_KEY, job_id)
                     self.redis_conn.hdel(self.ENTITY_INDEX_KEY, entity_id)
                     self.redis_conn.hdel(self.PROCESSING_ENTITIES_KEY, entity_id)
