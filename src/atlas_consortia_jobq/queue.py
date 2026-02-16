@@ -367,7 +367,7 @@ class JobQueue:
             uptime_seconds = time.perf_counter() - self.service_start_time
             durations = self.redis_conn.lrange('job_durations', 0, -1)
             status["total_jobs_processed"] = int(total_processed_raw) if total_processed_raw else 0
-            status["uptime"] = uptime_seconds
+            status["uptime"] = round(uptime_seconds, 2)
             if durations:
                 floats = [float(d) for d in durations]
                 avg_ms = sum(d for d in floats) / len(durations)
