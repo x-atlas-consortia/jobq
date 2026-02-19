@@ -22,6 +22,7 @@ class JobQueue:
     JOB_HASH_KEY = 'jobs_data'
     ENTITY_INDEX_KEY = 'entity_uuid'
     PROCESSING_ENTITIES_KEY = 'processing_entities'
+    TOTAL_PROCESSED_KEY = 'total_processed_count'
 
     
     # Lua script for atomic pop and fetch
@@ -82,7 +83,7 @@ class JobQueue:
     return "CREATED:" .. ARGV[2]
     """
     
-    def __init__(self, redis_host: str = 'localhost', redis_port: int = 6379, 
+    def __init__(self, redis_host: str = 'jobq-redis', redis_port: int = 6379, 
                  redis_db: int = 0, redis_password: Optional[str] = None, log_level: int = logging.INFO):
         """
         Initialize JobQueue with Redis connection details.
@@ -99,6 +100,7 @@ class JobQueue:
         """
         self.logger = logging.getLogger(f"{__name__}.JobQueue")
         self.logger.setLevel(log_level)
+        self.service_start_time = time.perf_counter()
 
         try:
             self.redis_conn = Redis(
@@ -110,9 +112,15 @@ class JobQueue:
             )
             self.redis_conn.ping()
             self.logger.info(f"Successfully connected to Redis at {redis_host}:{redis_port}, DB {redis_db}")
+            self.redis_conn.delete(self.TOTAL_PROCESSED_KEY, 'job_durations')
         except ConnectionError as e:
-            self.logger.error(f"Failed to connect to Redis at {redis_host}:{redis_port}: {e}")
-            raise ConnectionError(f"Failed to connect to Redis at {redis_host}:{redis_port}: {e}")
+            msg = f"Failed to connect to Redis at {redis_host}:{redis_port}: {e}"
+            self.logger.error(msg)
+            raise ConnectionError(msg)
+        except Exception as e:
+            msg = f"Unexpected error while connecting to redis. {e}"
+            self.logger.error(msg)
+            raise ConnectionError(msg)
         
         # Load Lua script
         try:
@@ -354,13 +362,33 @@ class JobQueue:
                 "priority_2_queued": p2,
                 "priority_3_queued": p3
             }
+
+            total_processed_raw = self.redis_conn.get(self.TOTAL_PROCESSED_KEY)
+            uptime_seconds = time.perf_counter() - self.service_start_time
+            durations = self.redis_conn.lrange('job_durations', 0, -1)
+            status["total_jobs_processed"] = int(total_processed_raw) if total_processed_raw else 0
+            status["uptime"] = int(uptime_seconds)
+            if durations:
+                floats = [float(d) for d in durations]
+                avg_ms = sum(d for d in floats) / len(durations)
+                min_secs = round(min(floats)/1000, 2)
+                max_secs = round(max(floats)/1000, 2)
+                avg_seconds = (avg_ms/1000)
+                rounded_avg_seconds = round(avg_seconds, 2)
+                status["avg_job_runtime"] = rounded_avg_seconds
+                status["min_job_runtime"] = min_secs
+                status["max_job_runtime"] = max_secs
+            else:
+                status["avg_job_runtime"] = 0
+                status["min_job_runtime"] = 0
+                status["max_job_runtime"] = 0
             if all_queued:
                 queued_ids = self.redis_conn.zrange(self.JOB_QUEUE_KEY, 0, -1)
                 status["queued_entities"] = self._get_detailed_info(queued_ids, mode='all_queued')
             if all_processing:
                 processing_job_ids = self.redis_conn.hvals(self.PROCESSING_ENTITIES_KEY) 
                 status["processing_entities"] = self._get_detailed_info(processing_job_ids, mode='all_processing')
-            
+
             return status
             
         except RedisError as e:
@@ -454,17 +482,22 @@ class JobQueue:
             entity_id = job_data['entity_id']
             self.logger.info(f"Worker (PID {subprocess.os.getpid()}) starting job: {job_id_str} (Priority {job_data.get('priority', '?')})")
 
+            start_time = time.perf_counter()
             try:
                 job_successful = self._execute_job(job_data)
             finally:
                 # Clean up job metadata
                 try:
+                    duration_ms = (time.perf_counter() - start_time) * 1000
+                    self.redis_conn.lpush('job_durations', duration_ms)
+                    self.redis_conn.ltrim('job_durations', 0, 49)
+                    self.redis_conn.incr(self.TOTAL_PROCESSED_KEY)
                     self.redis_conn.hdel(self.JOB_HASH_KEY, job_id)
                     self.redis_conn.hdel(self.ENTITY_INDEX_KEY, entity_id)
                     self.redis_conn.hdel(self.PROCESSING_ENTITIES_KEY, entity_id)
                     
                     if job_successful:
-                        self.logger.info(f"Worker (PID {subprocess.os.getpid()}) completed job {job_id_str} successfully. Metadata cleaned.")
+                        self.logger.info(f"Worker (PID {subprocess.os.getpid()}) completed job {job_id_str} with uuid {entity_id} successfully. Metadata cleaned.")
                     else:
                         self.logger.warning(f"Worker (PID {subprocess.os.getpid()}) job {job_id_str} failed. Metadata cleaned.")
                         
