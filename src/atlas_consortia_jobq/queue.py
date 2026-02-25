@@ -23,6 +23,8 @@ class JobQueue:
     ENTITY_INDEX_KEY = 'entity_uuid'
     PROCESSING_ENTITIES_KEY = 'processing_entities'
     TOTAL_PROCESSED_KEY = 'total_processed_count'
+    MIN_RUNTIME_KEY = 'min_runtime_key'
+    MAX_RUNTIME_KEY = 'max_runtime_key'
 
     
     # Lua script for atomic pop and fetch
@@ -83,6 +85,29 @@ class JobQueue:
     return "CREATED:" .. ARGV[2]
     """
     
+    # Lua script for atomic compare and update
+    SET_AND_COMPARE_MIN_MAX = """
+    -- KEYS[1]: MIN_RUNTIME_KEY
+    -- KEYS[2]: MAX_RUNTIME_KEY
+    -- ARGV[1]: duration_ms
+
+    local new_val = tonumber(ARGV[1])
+
+    -- Handle Min
+    local current_min = redis.call('get', KEYS[1])
+    if not current_min or new_val < tonumber(current_min) then
+        redis.call('set', KEYS[1], ARGV[1])
+    end
+
+    -- Handle Max
+    local current_max = redis.call('get', KEYS[2])
+    if not current_max or new_val > tonumber(current_max) then
+        redis.call('set', KEYS[2], ARGV[1])
+    end
+
+    return {current_min, current_max} -- Optional: returns old values
+    """
+
     def __init__(self, redis_host: str = 'jobq-redis', redis_port: int = 6379, 
                  redis_db: int = 0, redis_password: Optional[str] = None, log_level: int = logging.INFO):
         """
@@ -112,7 +137,7 @@ class JobQueue:
             )
             self.redis_conn.ping()
             self.logger.info(f"Successfully connected to Redis at {redis_host}:{redis_port}, DB {redis_db}")
-            self.redis_conn.delete(self.TOTAL_PROCESSED_KEY, 'job_durations')
+            self.redis_conn.delete(self.TOTAL_PROCESSED_KEY, self.MIN_RUNTIME_KEY, self.MAX_RUNTIME_KEY, 'job_durations')
         except ConnectionError as e:
             msg = f"Failed to connect to Redis at {redis_host}:{redis_port}: {e}"
             self.logger.error(msg)
@@ -126,6 +151,7 @@ class JobQueue:
         try:
             self.pop_and_fetch_script = self.redis_conn.script_load(self.POP_AND_FETCH_JOB)
             self.enqueue_atomic_script = self.redis_conn.script_load(self.ENQUEUE_JOB_ATOMIC)
+            self.set_min_max_script = self.redis_conn.script_load(self.SET_AND_COMPARE_MIN_MAX)
             self.logger.debug("Lua scripts loaded successfully")
         except RedisError as e:
             self.logger.error(f"Failed to load Lua script: {e}")
@@ -364,24 +390,22 @@ class JobQueue:
             }
 
             total_processed_raw = self.redis_conn.get(self.TOTAL_PROCESSED_KEY)
+            min_time = self.redis_conn.get(self.MIN_RUNTIME_KEY)
+            max_time = self.redis_conn.get(self.MAX_RUNTIME_KEY)
             uptime_seconds = time.perf_counter() - self.service_start_time
             durations = self.redis_conn.lrange('job_durations', 0, -1)
             status["total_jobs_processed"] = int(total_processed_raw) if total_processed_raw else 0
+            status['min_job_runtime'] = int(min_time) if min_time else 0
+            status['max_job_runtime'] = int(max_time) if max_time else 0
             status["uptime"] = int(uptime_seconds)
             if durations:
                 floats = [float(d) for d in durations]
                 avg_ms = sum(d for d in floats) / len(durations)
-                min_secs = round(min(floats)/1000, 2)
-                max_secs = round(max(floats)/1000, 2)
                 avg_seconds = (avg_ms/1000)
                 rounded_avg_seconds = round(avg_seconds, 2)
                 status["avg_job_runtime"] = rounded_avg_seconds
-                status["min_job_runtime"] = min_secs
-                status["max_job_runtime"] = max_secs
             else:
                 status["avg_job_runtime"] = 0
-                status["min_job_runtime"] = 0
-                status["max_job_runtime"] = 0
             if all_queued:
                 queued_ids = self.redis_conn.zrange(self.JOB_QUEUE_KEY, 0, -1)
                 status["queued_entities"] = self._get_detailed_info(queued_ids, mode='all_queued')
@@ -489,6 +513,25 @@ class JobQueue:
                 # Clean up job metadata
                 try:
                     duration_ms = (time.perf_counter() - start_time) * 1000
+                    self.redis_conn.evalsha(
+                        self.set_min_max_script,
+                        2,
+                        self.MIN_RUNTIME_KEY,
+                        self.MAX_RUNTIME_KEY,
+                        duration_ms
+                    )
+                    # min_time = self.redis_conn.get(self.MIN_RUNTIME_KEY)
+                    # max_time = self.redis_conn.get(self.MAX_RUNTIME_KEY)
+                    # if min_time:
+                    #     if duration_ms < min_time:
+                    #         self.redis_conn.set(self.MIN_RUNTIME_KEY, duration_ms)
+                    # else:
+                    #     self.redis_conn.set(self.MIN_RUNTIME_KEY, duration_ms)
+                    # if max_time:
+                    #     if duration_ms > max_time:
+                    #         self.redis_conn.set(self.MAX_RUNTIME_KEY, duration_ms)
+                    # else:
+                    #     self.redis_conn.set(self.MAX_RUNTIME_KEY, duration_ms)
                     self.redis_conn.lpush('job_durations', duration_ms)
                     self.redis_conn.ltrim('job_durations', 0, 49)
                     self.redis_conn.incr(self.TOTAL_PROCESSED_KEY)
