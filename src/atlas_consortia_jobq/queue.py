@@ -395,8 +395,8 @@ class JobQueue:
             uptime_seconds = time.perf_counter() - self.service_start_time
             durations = self.redis_conn.lrange('job_durations', 0, -1)
             status["total_jobs_processed"] = int(total_processed_raw) if total_processed_raw else 0
-            status['min_job_runtime'] = int(min_time) if min_time else 0
-            status['max_job_runtime'] = int(max_time) if max_time else 0
+            status['min_job_runtime'] = min_time if min_time else 0
+            status['max_job_runtime'] = max_time if max_time else 0
             status["uptime"] = int(uptime_seconds)
             if durations:
                 floats = [float(d) for d in durations]
