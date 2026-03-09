@@ -159,7 +159,7 @@ class JobQueue:
     
     @staticmethod
     def _generate_reference_id() -> str:
-        """Generate a unique chronological job ID using UUID1."""
+        """Generate a unique chronological Reference ID using UUID1."""
         return str(uuid.uuid1())
     
     def enqueue(self, task_func: Callable, entity_id: str, 
@@ -420,7 +420,7 @@ class JobQueue:
             raise RedisError(f"Failed to get queue status: {e}")
     
     def _get_detailed_info(self, entity_ids: list, mode: str) -> list:
-        """Helper to fetch and format metadata for a list of job IDs."""
+        """Helper to fetch and format metadata for a list of Entity IDs."""
         if not entity_ids:
             return []
         
