@@ -40,7 +40,7 @@ jq = JobQueue(
 
 Jobs require a function, an entity_id, and optional arguments.
 
-* job_id: A unique identifier generated for every specific job. This is created during the enqueing process and will be returned so the job may be referenced later.
+* reference_id: A unique identifier generated for every specific job. This is created during the enqueing process and will be returned so the job may be referenced later.
 
 * entity_id: The unique identifier of the resource being processed (e.g., a UUID). This prevents the same resource from being queued multiple times.
 
@@ -48,7 +48,7 @@ Jobs require a function, an entity_id, and optional arguments.
 def my_task(arg1, keyword_arg="default"):
     print(f"Processing: {arg1}, {keyword_arg}")
 
-job_id = jq.enqueue(
+reference_id = jq.enqueue(
     task_func=my_task,
     entity_id="unique_id_123",
     args=["value1"],
@@ -82,11 +82,11 @@ Adds a job to the queue.
 ```python
 update_priority(identifier, new_priority)
 ```
-Updates the priority of an existing job. The identifier can be a job_id or an entity_id.
+Updates the priority of an existing job. The identifier can be a reference_id or an entity_id.
 ```python
 get_status(identifier)
 ```
-Returns a dictionary containing the job_id, position_in_queue, and priority. Here **"identifier"** can be either the job_id or the entity_id.
+Returns a dictionary containing the reference_id, position_in_queue, and priority. Here **"identifier"** can be either the reference_id or the entity_id.
 
 ```python
 get_queue_status()
