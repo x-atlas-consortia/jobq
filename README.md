@@ -48,7 +48,7 @@ Jobs require a function, an entity_id, and optional arguments.
 def my_task(arg1, keyword_arg="default"):
     print(f"Processing: {arg1}, {keyword_arg}")
 
-reference = jq.enqueue(
+reference_id = jq.enqueue(
     task_func=my_task,
     entity_id="unique_id_123",
     args=["value1"],
