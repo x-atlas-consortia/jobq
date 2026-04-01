@@ -84,7 +84,60 @@ class JobQueue:
     redis.call('HSET', KEYS[3], ARGV[1], ARGV[2])
     return "CREATED:" .. ARGV[2]
     """
-    
+    BULK_ENQUEUE_ATOMIC = """
+    -- KEYS[1]: JOB_QUEUE_KEY
+    -- KEYS[2]: JOB_HASH_KEY
+    -- KEYS[3]: ENTITY_INDEX_KEY
+    -- KEYS[4]: PROCESSING_ENTITIES_KEY
+    -- ARGV layout (repeating groups of 5):
+    --   ARGV[1 + i*5]: entity_id
+    --   ARGV[2 + i*5]: reference_id
+    --   ARGV[3 + i*5]: job_json
+    --   ARGV[4 + i*5]: priority
+    --   ARGV[5 + i*5]: now
+
+    local created = 0
+    local updated = 0
+    local skipped = 0
+
+    local i = 0
+    while i < #ARGV do
+        local entity_id   = ARGV[i + 1]
+        local ref_id      = ARGV[i + 2]
+        local job_json    = ARGV[i + 3]
+        local priority    = tonumber(ARGV[i + 4])
+        local now         = ARGV[i + 5]
+        i = i + 5
+
+        local existing_ref = redis.call('HGET', KEYS[3], entity_id)
+        if existing_ref then
+            local existing_json = redis.call('HGET', KEYS[2], existing_ref)
+            if existing_json then
+                local existing = cjson.decode(existing_json)
+                if priority < tonumber(existing['priority']) then
+                    existing['priority'] = priority
+                    existing['priority_updated_timestamp'] = now
+                    redis.call('HSET', KEYS[2], existing_ref, cjson.encode(existing))
+                    redis.call('ZADD', KEYS[1], priority, existing_ref)
+                    updated = updated + 1
+                else
+                    skipped = skipped + 1
+                end
+            else
+                skipped = skipped + 1
+            end
+        elseif redis.call('HEXISTS', KEYS[4], entity_id) == 1 then
+            skipped = skipped + 1
+        else
+            redis.call('HSET', KEYS[2], ref_id, job_json)
+            redis.call('ZADD', KEYS[1], priority, ref_id)
+            redis.call('HSET', KEYS[3], entity_id, ref_id)
+            created = created + 1
+        end
+    end
+
+    return {created, updated, skipped}
+    """
     # Lua script for atomic compare and update
     SET_AND_COMPARE_MIN_MAX = """
     -- KEYS[1]: MIN_RUNTIME_KEY
@@ -152,6 +205,7 @@ class JobQueue:
             self.pop_and_fetch_script = self.redis_conn.script_load(self.POP_AND_FETCH_JOB)
             self.enqueue_atomic_script = self.redis_conn.script_load(self.ENQUEUE_JOB_ATOMIC)
             self.set_min_max_script = self.redis_conn.script_load(self.SET_AND_COMPARE_MIN_MAX)
+            self.bulk_enqueue_script = self.redis_conn.script_load(self.BULK_ENQUEUE_ATOMIC)
             self.logger.debug("Lua scripts loaded successfully")
         except RedisError as e:
             self.logger.error(f"Failed to load Lua script: {e}")
@@ -245,6 +299,85 @@ class JobQueue:
         except RedisError as e:
             self.logger.error(f"Failed to enqueue job: {e}")
             raise RedisError(f"Failed to enqueue job: {e}")
+    
+    
+    def bulk_enqueue(
+        self,
+        task_func: Callable,
+        jobs: List[Dict[str, Any]],
+        priority: int = 2,
+    ) -> Dict[str, Any]:
+        """
+        Enqueue multiple jobs in a single Redis round-trip.
+
+        Args:
+            task_func: The function to be executed for all jobs in this batch
+            jobs: List of dicts, each with keys:
+                    entity_id   (required)
+                    args        (optional, default [])
+                    kwargs      (optional, default {})
+                    metadata    (optional, default {})
+            priority: Priority applied to every job in the batch (1/2/3)
+
+        Returns:
+            Dict with keys: created, updated, skipped
+
+        Raises:
+            ValueError: If priority is invalid or jobs list is empty
+            RedisError: If Redis operations fail
+        """
+        if priority not in [1, 2, 3]:
+            raise ValueError(f"Invalid priority: {priority}. Must be 1, 2, or 3.")
+        if not jobs:
+            raise ValueError("jobs list must not be empty.")
+
+        now = datetime.now(timezone.utc).isoformat()
+        argv = []
+
+        for job in jobs:
+            entity_id = job["entity_id"]
+            reference_id = self._generate_reference_id()
+            job_data = {
+                "task_module": task_func.__module__,
+                "task_name": task_func.__name__,
+                "args": job.get("args", []),
+                "kwargs": job.get("kwargs", {}),
+                "reference_id": reference_id,
+                "entity_id": entity_id,
+                "priority": priority,
+                "queued_timestamp": now,
+                "priority_updated_timestamp": None,
+                "metadata": job.get("metadata", {}),
+            }
+            argv.extend([
+                entity_id,
+                reference_id,
+                json.dumps(job_data),
+                str(priority),
+                now,
+            ])
+
+        try:
+            result = self.redis_conn.evalsha(
+                self.bulk_enqueue_script,
+                4,
+                self.JOB_QUEUE_KEY,
+                self.JOB_HASH_KEY,
+                self.ENTITY_INDEX_KEY,
+                self.PROCESSING_ENTITIES_KEY,
+                *argv,
+            )
+            created, updated, skipped = int(result[0]), int(result[1]), int(result[2])
+            self.logger.info(
+                f"bulk_enqueue: {created} created, {updated} priority-updated, "
+                f"{skipped} skipped (already queued/processing)"
+            )
+            return {"created": created, "updated": updated, "skipped": skipped}
+
+        except RedisError as e:
+            self.logger.error(f"Failed to bulk enqueue jobs: {e}")
+            raise RedisError(f"Failed to bulk enqueue jobs: {e}")
+
     
     def update_priority(self, identifier: str, new_priority: int) -> str:
         """
