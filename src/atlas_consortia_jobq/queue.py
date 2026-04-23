@@ -589,7 +589,7 @@ class JobQueue:
         func_name = job_data['task_name']
         args = job_data.get('args', [])
         kwargs = job_data.get('kwargs', {})
-        reference_id = job_data.get('referenec_id', 'unknown')
+        reference_id = job_data.get('reference_id', 'unknown')
         
         try:
             self.logger.debug(f"Executing job {reference_id}: {module_name}.{func_name}")
