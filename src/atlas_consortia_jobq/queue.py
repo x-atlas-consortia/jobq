@@ -15,6 +15,13 @@ class JobQueue:
     
     Uses Redis ZSET for priority ordering and hashes for job metadata and deduplication.
     Supports job enqueueing, priority updates, status checks, and worker management.
+
+    Supports dual-database operation:
+    - DB 0: Live reindex jobs (high priority, normal indices)
+    - DB 1: Fresh_indices full reindex jobs (background priority, temporary indices)
+
+    Workers poll DB 0 first, fall back to DB 1 if DB 0 is empty, ensuring live
+    reindex requests always take precedence over background full reindexes.
     """
     
     # Redis key constants
@@ -169,7 +176,7 @@ class JobQueue:
         Args:
             redis_host: Redis server hostname
             redis_port: Redis server port
-            redis_db: Redis database number
+            redis_db: Redis database number (this is the primary DB, typically 0 for live reindex)
             redis_password: Redis password (optional)
             log_level: Logging level (default: logging.INFO)
             
@@ -179,7 +186,10 @@ class JobQueue:
         self.logger = logging.getLogger(f"{__name__}.JobQueue")
         self.logger.setLevel(log_level)
         self.service_start_time = time.perf_counter()
-
+        self.redis_host = redis_host
+        self.redis_port = redis_port
+        self.redis_password = redis_password
+        self.redis_db = redis_db
         try:
             self.redis_conn = Redis(
                 host=redis_host, 
@@ -606,6 +616,7 @@ class JobQueue:
         """
         Main worker loop. Continuously polls Redis for jobs and executes them.
         This runs in a subprocess spawned by start_workers().
+        Polls DB 0 (live reindex) first, falls back to DB 1 (fresh_indices) if DB 0 is empty.
         """
         self.logger.info(f"Worker (PID {subprocess.os.getpid()}) starting up")
         
@@ -613,6 +624,10 @@ class JobQueue:
             try:
                 # Pop job from queue atomically
                 now = datetime.now(timezone.utc).isoformat()
+                active_db = None
+                result = None
+                
+                self.redis_conn.select(0)
                 result = self.redis_conn.evalsha(
                     self.pop_and_fetch_script, 
                     3, 
@@ -621,6 +636,21 @@ class JobQueue:
                     self.PROCESSING_ENTITIES_KEY,
                     now
                 )
+                if result:
+                    active_db = 0
+                if not result:
+                    self.redis_conn.select(1)
+                    result = self.redis_conn.evalsha(
+                        self.pop_and_fetch_script,
+                        3,
+                        self.JOB_QUEUE_KEY,
+                        self.JOB_HASH_KEY,
+                        self.PROCESSING_ENTITIES_KEY,
+                        now
+                    )
+                    if result:
+                        active_db = 1
+            
             except RedisError as e:
                 self.logger.critical(f"FATAL: Error during job pop: {e}. Worker exiting.")
                 break
@@ -635,10 +665,9 @@ class JobQueue:
             reference_id_str = reference_id.decode() if isinstance(reference_id, bytes) else reference_id
             job_json = result[1]
             job_data = json.loads(job_json)
-        
-            entity_id = job_data['entity_id']
-            self.logger.info(f"Worker (PID {subprocess.os.getpid()}) starting job: {reference_id_str} (Priority {job_data.get('priority', '?')})")
 
+            entity_id = job_data['entity_id']
+            self.logger.info(f"Worker (PID {subprocess.os.getpid()}) starting job: {reference_id_str} (Priority {job_data.get('priority', '?')}) from DB {active_db}")
             start_time = time.perf_counter()
             try:
                 job_successful = self._execute_job(job_data)
@@ -646,6 +675,7 @@ class JobQueue:
                 # Clean up job metadata
                 try:
                     duration_ms = (time.perf_counter() - start_time) * 1000
+                    self.redis_conn.select(active_db)
                     self.redis_conn.evalsha(
                         self.set_min_max_script,
                         2,
@@ -653,18 +683,7 @@ class JobQueue:
                         self.MAX_RUNTIME_KEY,
                         duration_ms
                     )
-                    # min_time = self.redis_conn.get(self.MIN_RUNTIME_KEY)
-                    # max_time = self.redis_conn.get(self.MAX_RUNTIME_KEY)
-                    # if min_time:
-                    #     if duration_ms < min_time:
-                    #         self.redis_conn.set(self.MIN_RUNTIME_KEY, duration_ms)
-                    # else:
-                    #     self.redis_conn.set(self.MIN_RUNTIME_KEY, duration_ms)
-                    # if max_time:
-                    #     if duration_ms > max_time:
-                    #         self.redis_conn.set(self.MAX_RUNTIME_KEY, duration_ms)
-                    # else:
-                    #     self.redis_conn.set(self.MAX_RUNTIME_KEY, duration_ms)
+
                     self.redis_conn.lpush('job_durations', duration_ms)
                     self.redis_conn.ltrim('job_durations', 0, 49)
                     self.redis_conn.incr(self.TOTAL_PROCESSED_KEY)
@@ -673,9 +692,9 @@ class JobQueue:
                     self.redis_conn.hdel(self.PROCESSING_ENTITIES_KEY, entity_id)
                     
                     if job_successful:
-                        self.logger.info(f"Worker (PID {subprocess.os.getpid()}) completed job {reference_id_str} with uuid {entity_id} successfully. Metadata cleaned.")
+                        self.logger.info(f"Worker (PID {subprocess.os.getpid()}) completed job {reference_id_str} from DB {active_db} successfully. Metadata cleaned.")
                     else:
-                        self.logger.warning(f"Worker (PID {subprocess.os.getpid()}) job {reference_id_str} failed. Metadata cleaned.")
+                        self.logger.warning(f"Worker (PID {subprocess.os.getpid()}) job {reference_id_str} from DB {active_db} failed. Metadata cleaned.")
                         
                 except RedisError as e:
                     self.logger.warning(f"FATAL Cleanup Error for job {reference_id_str}: {e}. Worker forced to exit.")
@@ -689,6 +708,9 @@ class JobQueue:
         
         This method spawns multiple subprocess workers and blocks until interrupted.
         Each worker runs independently and processes jobs as they become available.
+        
+        Workers are initialized with the primary redis_db (0 for live reindex), but
+        internally use redis.select() to poll both DB 0 and DB 1 as needed.
         
         Args:
             num_workers: Number of worker processes to spawn (default: 4)
@@ -718,9 +740,7 @@ class JobQueue:
                     "sys.path.insert(0, '/usr/src/app/src'); "
                     "sys.path.insert(0, '/usr/src/app/src/search-adaptor/src'); "
                     f"from {self.__module__} import JobQueue; "
-                    f"queue = JobQueue('{self.redis_conn.connection_pool.connection_kwargs['host']}', "
-                    f"{self.redis_conn.connection_pool.connection_kwargs['port']}, "
-                    f"{self.redis_conn.connection_pool.connection_kwargs['db']}); "
+                    f"queue = JobQueue('{self.redis_host}', {self.redis_port}, {self.redis_db}, '{self.redis_password}'); "
                     "queue._worker_loop()"
                 ])
                 processes.append(proc)
