@@ -740,7 +740,7 @@ class JobQueue:
                     "sys.path.insert(0, '/usr/src/app/src'); "
                     "sys.path.insert(0, '/usr/src/app/src/search-adaptor/src'); "
                     f"from {self.__module__} import JobQueue; "
-                    f"queue = JobQueue('{self.redis_host}', {self.redis_port}, {self.redis_db}, '{self.redis_password}'); "
+                    f"queue = JobQueue('{self.redis_host}', {self.redis_port}, {self.redis_db}, {repr(self.redis_password)}); "
                     "queue._worker_loop()"
                 ])
                 processes.append(proc)
