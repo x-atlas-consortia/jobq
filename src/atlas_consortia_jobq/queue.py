@@ -669,6 +669,12 @@ class JobQueue:
             entity_id = job_data['entity_id']
             self.logger.info(f"Worker (PID {subprocess.os.getpid()}) starting job: {reference_id_str} (Priority {job_data.get('priority', '?')}) from DB {active_db}")
             start_time = time.perf_counter()
+            
+            run_mode = "[LIVE]" if active_db == 0 else "[FULL]"
+            root_logger = logging.getLogger()
+            if root_logger.handlers:
+                root_logger.handlers[0].setFormatter(logging.Formatter(f'%(asctime)s [Worker PID %(process)d] {run_mode} %(levelname)s: %(message)s'))
+
             try:
                 job_successful = self._execute_job(job_data)
             finally:
@@ -729,8 +735,9 @@ class JobQueue:
             for i in range(num_workers):
                 # Fork a new process that runs the worker loop
                 proc = subprocess.Popen([
-                    sys.executable, "-c",
-                    "import sys; "
+                    sys.executable, "-u", "-c",
+                    "import sys, logging; "
+                    "logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s [Worker PID %(process)d] [INIT] %(levelname)s: %(message)s'); "
                     #Explicitly add the application source roots to sys.path for worker processes.
                     #These subprocesses are launched outside the normal entrypoint and do not
                     #inherit the same working directory or import context as the main service.
