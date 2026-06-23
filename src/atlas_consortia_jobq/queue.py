@@ -667,8 +667,10 @@ class JobQueue:
             job_data = json.loads(job_json)
 
             entity_id = job_data['entity_id']
-            self.logger.info(f"Worker (PID {subprocess.os.getpid()}) starting job: {reference_id_str} (Priority {job_data.get('priority', '?')}) from DB {active_db}")
+            run_mode = "[LIVE]" if active_db == 0 else "[FULL]"
+            self.logger.info(f"Worker (PID {subprocess.os.getpid()}) {run_mode} starting job: {reference_id_str} (Priority {job_data.get('priority', '?')}) from DB {active_db}")
             start_time = time.perf_counter()
+
             try:
                 job_successful = self._execute_job(job_data)
             finally:
@@ -692,10 +694,9 @@ class JobQueue:
                     self.redis_conn.hdel(self.PROCESSING_ENTITIES_KEY, entity_id)
                     
                     if job_successful:
-                        self.logger.info(f"Worker (PID {subprocess.os.getpid()}) completed job {reference_id_str} from DB {active_db} successfully. Metadata cleaned.")
+                        self.logger.info(f"Worker (PID {subprocess.os.getpid()}) {run_mode} completed job {reference_id_str} from DB {active_db} successfully. Metadata cleaned.")
                     else:
-                        self.logger.warning(f"Worker (PID {subprocess.os.getpid()}) job {reference_id_str} from DB {active_db} failed. Metadata cleaned.")
-                        
+                        self.logger.warning(f"Worker (PID {subprocess.os.getpid()}) {run_mode} job {reference_id_str} from DB {active_db} failed. Metadata cleaned.")
                 except RedisError as e:
                     self.logger.warning(f"FATAL Cleanup Error for job {reference_id_str}: {e}. Worker forced to exit.")
                     break
@@ -729,8 +730,9 @@ class JobQueue:
             for i in range(num_workers):
                 # Fork a new process that runs the worker loop
                 proc = subprocess.Popen([
-                    sys.executable, "-c",
-                    "import sys; "
+                    sys.executable, "-u", "-c",
+                    "import sys, logging; "
+                    "logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s [Worker PID %(process)d] %(levelname)s in %(module)s: %(message)s'); "
                     #Explicitly add the application source roots to sys.path for worker processes.
                     #These subprocesses are launched outside the normal entrypoint and do not
                     #inherit the same working directory or import context as the main service.
