@@ -697,7 +697,7 @@ class JobQueue:
 
                     if active_db == 1:
                         self.redis_conn.select(0)
-                        self.redis_conn.set(self.LAST_FULL_REINDEX_COMPLETION_KEY, datetime.now(timezone.utc).isoformat())
+                        self.redis_conn.set(self.LAST_FULL_REINDEX_COMPLETION_KEY, datetime.now().isoformat())
                         self.redis_conn.select(1)
                     
                     if job_successful:
