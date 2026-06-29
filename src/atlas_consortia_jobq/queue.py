@@ -696,7 +696,9 @@ class JobQueue:
                     self.redis_conn.hdel(self.PROCESSING_ENTITIES_KEY, entity_id)
 
                     if active_db == 1:
+                        self.redis_conn.select(0)
                         self.redis_conn.set(self.LAST_FULL_REINDEX_COMPLETION_KEY, datetime.now(timezone.utc).isoformat())
+                        self.redis_conn.select(1)
                     
                     if job_successful:
                         self.logger.info(f"Worker (PID {subprocess.os.getpid()}) {run_mode} completed job {reference_id_str} from DB {active_db} successfully. Metadata cleaned.")
