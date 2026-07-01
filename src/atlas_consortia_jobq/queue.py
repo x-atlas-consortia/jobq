@@ -32,7 +32,7 @@ class JobQueue:
     TOTAL_PROCESSED_KEY = 'total_processed_count'
     MIN_RUNTIME_KEY = 'min_runtime_key'
     MAX_RUNTIME_KEY = 'max_runtime_key'
-
+    LAST_FULL_REINDEX_COMPLETION_KEY = 'last_full_reindex_completion'
     
     # Lua script for atomic pop and fetch
     POP_AND_FETCH_JOB = """
@@ -537,10 +537,12 @@ class JobQueue:
             max_time = self.redis_conn.get(self.MAX_RUNTIME_KEY)
             uptime_seconds = time.perf_counter() - self.service_start_time
             durations = self.redis_conn.lrange('job_durations', 0, -1)
+            last_full_reindex_completion_raw = self.redis_conn.get(self.LAST_FULL_REINDEX_COMPLETION_KEY)
             status["total_jobs_processed"] = int(total_processed_raw) if total_processed_raw else 0
             status['min_job_runtime'] = round(float(min_time) / 1000, 2) if min_time else 0
             status['max_job_runtime'] = round(float(max_time) / 1000, 2) if max_time else 0
             status["uptime"] = int(uptime_seconds)
+            status["last_full_reindex_completion"] = last_full_reindex_completion_raw.decode() if last_full_reindex_completion_raw else None
             if durations:
                 floats = [float(d) for d in durations]
                 avg_ms = sum(d for d in floats) / len(durations)
@@ -667,8 +669,10 @@ class JobQueue:
             job_data = json.loads(job_json)
 
             entity_id = job_data['entity_id']
-            self.logger.info(f"Worker (PID {subprocess.os.getpid()}) starting job: {reference_id_str} (Priority {job_data.get('priority', '?')}) from DB {active_db}")
+            run_mode = "[LIVE]" if active_db == 0 else "[FULL]"
+            self.logger.info(f"Worker (PID {subprocess.os.getpid()}) {run_mode} starting job: {reference_id_str} (Priority {job_data.get('priority', '?')}) from DB {active_db}")
             start_time = time.perf_counter()
+
             try:
                 job_successful = self._execute_job(job_data)
             finally:
@@ -690,12 +694,16 @@ class JobQueue:
                     self.redis_conn.hdel(self.JOB_HASH_KEY, reference_id)
                     self.redis_conn.hdel(self.ENTITY_INDEX_KEY, entity_id)
                     self.redis_conn.hdel(self.PROCESSING_ENTITIES_KEY, entity_id)
+
+                    if active_db == 1:
+                        self.redis_conn.select(0)
+                        self.redis_conn.set(self.LAST_FULL_REINDEX_COMPLETION_KEY, datetime.now().isoformat())
+                        self.redis_conn.select(1)
                     
                     if job_successful:
-                        self.logger.info(f"Worker (PID {subprocess.os.getpid()}) completed job {reference_id_str} from DB {active_db} successfully. Metadata cleaned.")
+                        self.logger.info(f"Worker (PID {subprocess.os.getpid()}) {run_mode} completed job {reference_id_str} from DB {active_db} successfully. Metadata cleaned.")
                     else:
-                        self.logger.warning(f"Worker (PID {subprocess.os.getpid()}) job {reference_id_str} from DB {active_db} failed. Metadata cleaned.")
-                        
+                        self.logger.warning(f"Worker (PID {subprocess.os.getpid()}) {run_mode} job {reference_id_str} from DB {active_db} failed. Metadata cleaned.")
                 except RedisError as e:
                     self.logger.warning(f"FATAL Cleanup Error for job {reference_id_str}: {e}. Worker forced to exit.")
                     break
@@ -729,8 +737,9 @@ class JobQueue:
             for i in range(num_workers):
                 # Fork a new process that runs the worker loop
                 proc = subprocess.Popen([
-                    sys.executable, "-c",
-                    "import sys; "
+                    sys.executable, "-u", "-c",
+                    "import sys, logging; "
+                    "logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s [Worker PID %(process)d] %(levelname)s in %(module)s: %(message)s'); "
                     #Explicitly add the application source roots to sys.path for worker processes.
                     #These subprocesses are launched outside the normal entrypoint and do not
                     #inherit the same working directory or import context as the main service.
